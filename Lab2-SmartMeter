@@ -1,0 +1,369 @@
+/* ************************************************************************************* 
+ * PSU 2019 - LoRa Lab 
+ * For STM32L0 LoRa Board
+ * 
+ * ==== LoRaWAN 2019 Test with CAT lora server ==== 
+ * Note:     DataRate         TxPower(EIRP with G_ant = 2)
+ * AS923:    DR_0-DR_6        2dbm-16dbm
+ * [DR0=SF12 ,DR1=SF11 ,DR2=SF10 ,DR3=SF9 ,DR4=SF8 ,DR5=SF7] 
+ * 
+ * Defualt Tx parameter
+ * TRANSMIT( MaxPayloadSize: 11, DR: 2, TxPower: 16.0dbm)
+ * Channel=2 [923.20 , 923.40 MHz]
+ * 
+ * Step to Config. Code
+ * 1. LoRaWAN.begin(AS923)
+ * 2. LoRaWAN.setSubBand()  //เฉพาะ AU915/US915 มี 64+8 channels
+ * 3. setDutyCycle(false)
+ * 4. setAntennaGain()   // default is 2.0
+ * 5. LoRaWAN.setADR(false)
+ * 6. LoRaWAN.setDataRate(1)  // for set SF
+ * 7. LoRaWAN.setTxPower(14)
+ * 8. LoRaWAN.joinOTAA(appEui, appKey, devEui)  <<<< Can control DR, SF, TXpower
+ * 9. LoRaWAN.joinABP(devAddr, nwkSKey, appSKey);  
+ * *********************************************************************************** */
+
+#include "LoRaWAN.h"          // LoRaWAN lib.
+#include "stm32l0_uart.h"     // config uart with parity
+#include <ModbusMaster.h>     // modbus via RS485
+
+
+/* *************************************************************************************
+ *  LoRa & LoRaWAN parameters configuration
+ * **************************************************************************************/
+// Node ID to Register on CAT LoRa Server
+const char *devEui = "XXXXXXXXXXXXXXXX"; 
+const char *appEui = "XXXXXXXXXXXXXXXX";
+const char *appKey = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+unsigned int DR = 0;
+unsigned int TXPower = 14;
+   
+
+/* ************************************************************************************* 
+ * Modbus configuration connected Smart Meter
+ * *********************************************************************************** */
+ModbusMaster nodemeter;
+#define MAX485_DE      9        // |   pin DE -> pin D9   |   pin DI -> pin D8 (TX1)   |
+#define MAX485_RE_NEG  9        // |   pin RE -> pin D9   |   pin RO -> pin D2 (RX1)   |
+#define METER_ADDR     1        // address 1
+#define ADDR_START     0x0064   // The address of first register equal 100(DEC) or 0x64 (HEX)                             
+#define ADDR_NUMBER    16       // Number of register that you want to read = 16(DEC) register
+void preTransmission(){
+  digitalWrite(MAX485_RE_NEG, 1);
+  digitalWrite(MAX485_DE, 1);     }
+void postTransmission(){
+  digitalWrite(MAX485_RE_NEG, 0);
+  digitalWrite(MAX485_DE, 0);     }
+
+
+/* ************************************************************************************* 
+ *  Smart Meter parameter 
+ * *************************************************************************************/
+uint16_t V = 0;             // uint16_t [0-65,535] , uint8_t [0-255]
+uint16_t A = 0;
+uint32_t W = 0;
+uint32_t Wh = 0;            // uint32_t [0-4,294,967,295]
+uint16_t F = 0;             // ex f = 502 -> 50.2 to uint16_t
+float    PF = 0;            // for manual calulation
+unsigned int count = 1;     // counter loop to build each packet 
+uint16_t power_f = 0;       // for integer build data
+
+   
+/* **************************************************************
+ * Packet sizing
+ * *************************************************************/
+byte payload[18];            // buffer size of build packet 
+// packet size 18 byte  =>  volt = 2 / amp = 2 / pf = 2 / watt = 2 / kwh = 4 / f = 2 / counter = 4
+
+
+/* *************************************************************************************
+ *  Time interval and LED status
+ * **************************************************************************************/
+const int ledPin =  LED_BUILTIN;      // LoRa radio signal status
+int ledState = LOW; 
+const int interval_tx = 10000;        // time interval Trasmitting packet (sec)
+const int interval_led = 300;         // time interval hold LED LoRa status
+unsigned long previous_tx = 0; 
+unsigned long previous_led = 0; 
+
+
+/* **************************************************************
+ * Setup fucntion
+ * *************************************************************/
+void setup( void )
+{
+    Serial.begin(115200);             // Serial monitor
+    while (!Serial) { }               // waiting serial
+    Serial1.begin(1200,SERIAL_8E1);   // Serial_1 (D2,D8 pin) for Modbus protocal
+    delay(50);
+    pinMode(ledPin, OUTPUT);          // LED Radio blink status
+    
+    /************************ Modbus Setup *************************************/
+    pinMode(MAX485_RE_NEG, OUTPUT);               
+    pinMode(MAX485_DE, OUTPUT);                   
+    digitalWrite(MAX485_RE_NEG, 0);
+    digitalWrite(MAX485_DE, 0);   
+    nodemeter.begin(METER_ADDR, Serial1);         // slave id = 1 connected by serial 1
+    nodemeter.preTransmission(preTransmission);
+    nodemeter.postTransmission(postTransmission);
+    
+    /************************ LoRaWAN Setup *************************************/
+    LoRaWAN.begin(AS923);             // AS923 freq. plan with 8 channel
+    LoRaWAN.setAntennaGain(2.0);      // TXpower = 14dBm + 2dBi = 16dBm (EIRP) for AS923
+    LoRaWAN.setADR(false);            // disabal Adaptive Data Rate (ADR)
+    LoRaWAN.setDataRate(DR);          // set data rate
+    LoRaWAN.setTxPower(TXPower);      // set transmitting power       
+    LoRaWAN.joinOTAA(appEui, appKey, devEui);     // Starting to join the network
+    
+    Serial.println("JOIN( )");    
+    Serial.println("Smart Meter Reading...");
+    delay(1000);
+
+}  //end setup
+
+
+/* **************************************************************
+ * Loop fucntion
+ * *************************************************************/
+void loop( void )
+{ 
+  if(millis()<20000){                        // first 20 sec this time to sync
+     joinLoRaWAN();                          // show status join of OTAA at fist time syc.  
+     first_packet();                         // try to send first packet         
+  } else {   
+   unsigned long current_tx = millis();      // Time interval of send Packet without Delay command
+   if (current_tx - previous_tx >= interval_tx) 
+   {
+      switch_DR();                            // switc data rate by SF
+      led_blink();                            // packet send status
+      do_sense();                             // Reading sensor and print out.
+      build_data();                           // build data payload in byte(HEX) into the buffer.
+      lora_send();                            // sending packet LoRa  
+      count++;                                // Counter my loop
+      previous_tx = current_tx;        
+    } //end if interval
+  }
+    delay(100);
+} //end loop
+
+
+/* **************************************************************
+ * First packet for sync
+ * *************************************************************/
+void first_packet()
+{
+    LoRaWAN.beginPacket();
+    LoRaWAN.write(0xFF);
+    LoRaWAN.write(0xFF);
+    LoRaWAN.write(0xFF);
+    LoRaWAN.write(0xFF);
+    LoRaWAN.endPacket();
+}
+
+
+/* **************************************************************
+ * OTAA sync status at first time
+ * *************************************************************/
+void joinLoRaWAN()
+{
+  if (LoRaWAN.joined() && !LoRaWAN.busy())
+  {
+    if (LoRaWAN.confirmed())    
+        Serial.println("ACK");
+    else 
+        Serial.println("NACK");   
+    Serial.print("CHECK( ");
+    Serial.print("RSSI: ");
+    Serial.print(LoRaWAN.lastRSSI());
+    Serial.print(", SNR: ");
+    Serial.print(LoRaWAN.lastSNR());
+    Serial.print(", Margin: ");
+    Serial.print(LoRaWAN.linkMargin());
+    Serial.print(", Gateways: ");
+    Serial.print(LoRaWAN.linkGateways());
+    Serial.println(" )");
+  }  
+} //end joinLoRaWAN
+
+
+/* **************************************************************
+ * LED grean Blink for Sending LoRa Status
+ * *************************************************************/
+void led_blink()
+{
+   unsigned long current_led = millis();
+   if (current_led - previous_led >= interval_led) 
+   {
+        previous_led = current_led;
+        if (ledState == LOW) 
+            ledState = HIGH;
+        else 
+            ledState = LOW;
+        digitalWrite(ledPin, ledState);     // LED power status blink
+    }  
+} //end led_blink
+
+
+/* ******************************************************************************
+ * To do reading the data Smart Meter from Mosbus 
+ * *****************************************************************************/
+void do_sense() 
+{  
+   uint8_t result;      // buffer of modbus
+   Serial.println(".........................Read..Smart..Meter...........................");      
+   result = nodemeter.readHoldingRegisters(ADDR_START, ADDR_NUMBER);     // Dec. start 40100        
+      // check SM is connected OK or Not.  
+      if (result == nodemeter.ku8MBSuccess) {   
+          V = nodemeter.getResponseBuffer(0x02) ;   //Dec. reg. 40103 - 40100 -1 = 2
+          F = nodemeter.getResponseBuffer(0x05);    //Dec. reg. 40106 - 40100 -1 = 5
+          Wh = (nodemeter.getResponseBuffer(0x0A)<<16) + nodemeter.getResponseBuffer(0x0B); //Dec. reg. 40111 - 40100 -1 = 10     
+          A = nodemeter.getResponseBuffer(0x0C);    //Dec. reg. 40113 - 40100 -1 = 12
+          W = nodemeter.getResponseBuffer(0x0F);    //Dec. reg. 40116 - 40100 -1 = 15                                     
+      }else{
+        Serial.print("Modbus Error Meter not Connected (");
+        Serial.print(result,HEX);  
+        Serial.println(")");
+        V=0;A=0;F=0;W=0;  
+      }
+      // Done get data and then print out
+          Serial.print("Line Voltage (RMS) (V) >>>>> ");
+          Serial.println((float)V/100,2); // Line Voltage (RMS) (V) 
+          
+          Serial.print("Line Current (RMS) (A) >>>>> ");
+          Serial.println((float)A/100,2); // Line Current (RMS) (A)  
+            
+          Serial.print("Power Factor (PF) >>>>> ");
+          PF = (float)W / (((float)V*(float)A)/10000) ;
+          if(A*V == 0){
+            Serial.println("No Load !!! ");     PF = 0;            
+          }else      
+            Serial.println(PF,2);   
+
+          Serial.print("Active Power (Watt) >>>>> ");
+          Serial.println(W); // Active Power (W)     
+                                   
+          Serial.print("Frequency (Hz) >>>>> ");
+          Serial.println((float)F/10,1); // Frequency (Hz)    
+                
+          Serial.print("Active Energy (kWh) >>>>> ");    
+          Serial.println((float)Wh/1000,3); // Active Energy (Wh) imp+exp                        
+        
+          Serial.print("Count in loop >>>>> ");   // for test  packet error rate
+          Serial.println(count); 
+    
+      delay(100);  
+} // end do_sense()
+
+
+/* *******************************************************************************
+ * build data by the byte (HEX) pattern
+ * *******************************************************************************/
+void build_data() 
+{   
+    int index = 0;    // i++ จะเพิ่มค่าตนเองขึ้น 1 หลังจากจบประโยค ;
+    // voltage (unit 0.01V)
+    payload[index++] = (V >> 8) & 0xFF ;       // 2 bytes      
+    payload[index++] = V & 0xFF;
+    // current (unit 0.01A)
+    payload[index++] = (A >> 8) & 0xFF;        // 2 bytes  
+    payload[index++] = A & 0xFF;
+    // power factor (unit 0.01)    
+    power_f = PF*100;   
+    payload[index++] = (power_f >> 8) & 0xFF;  // 2 bytes  
+    payload[index++] = power_f & 0xFF;   
+    // power (unit 1W)    
+    payload[index++] = (W >> 8) & 0xFF;        // 2 bytes  
+    payload[index++] = W & 0xFF;  
+    // energy wh  (unit 1Wh) 
+    payload[index++] = (Wh >> 24) & 0xFF;      // 4 bytes
+    payload[index++] = (Wh >> 16) & 0xFF;  
+    payload[index++] = (Wh >> 8) & 0xFF;     
+    payload[index++] = Wh & 0xFF;         
+    // freq  (unit 0.1Hz)
+    payload[index++] = (F >> 8) & 0xFF;        // 2 bytes  
+    payload[index++] = F & 0xFF;       
+    // counter  (unit 1)
+    payload[index++] = (count >> 24) & 0xFF;   // 4 bytes
+    payload[index++] = (count >> 16) & 0xFF;
+    payload[index++] = (count >> 8) & 0xFF;         
+    payload[index++] = count & 0xFF;
+    
+/* =========== set Decode Payload in TTN =======================
+function Decoder(bytes, port) 
+{ var j=0;
+	var V   = (bytes[j++] << 8) | bytes[j++];       
+	var A   = (bytes[j++] << 8) | bytes[j++];       
+	var PF  = (bytes[j++] << 8) | bytes[j++];       
+	var W   = (bytes[j++] << 8) | bytes[j++];        
+	var Wh  = (bytes[j++]<<24) | (bytes[j++]<<16) | (bytes[j++]<<8) | bytes[j++];
+	var F   = (bytes[j++] << 8) | bytes[j++];      
+	var Count = (bytes[j++]<<24) | (bytes[j++]<<16) | (bytes[j++]<<8) | bytes[j++];
+  return {  
+            volt: V/100,
+            current: A/100,
+            pf: PF/100,
+            watt: W,
+            kWh: Wh/1000,
+            freq: F/10,           
+            count: Count
+  };
+}===================================================================== */  
+} // end build_data()
+
+
+/* *****************************************************************************
+* Sending the packet
+* ******************************************************************************/
+void lora_send() 
+{    
+    if (LoRaWAN.joined() && !LoRaWAN.busy())
+    {
+        Serial.print("TRANSMIT( ");
+        Serial.print("TimeOnAir: ");
+        Serial.print(LoRaWAN.getTimeOnAir());
+        Serial.print(", NextTxTime: ");
+        Serial.print(LoRaWAN.getNextTxTime());
+        Serial.print(", MaxPayloadSize: ");
+        Serial.print(LoRaWAN.getMaxPayloadSize());
+        Serial.print(", DR: ");
+        Serial.print(LoRaWAN.getDataRate());
+        Serial.print(", TxPower: ");
+        Serial.print(LoRaWAN.getTxPower(), 1);
+        Serial.print("dbm, UpLinkCounter: ");
+        Serial.print(LoRaWAN.getUpLinkCounter());
+        Serial.print(", DownLinkCounter: ");
+        Serial.print(LoRaWAN.getDownLinkCounter());
+        Serial.println(" )");
+
+        Serial.print("LoRa payload packet (");
+        Serial.print(sizeof(payload)); 
+        Serial.print("bytes) : 0 x ");
+        LoRaWAN.beginPacket();
+        for(int i=0; i<sizeof(payload) ; i++)
+        { 
+          LoRaWAN.write(payload[i]);
+          Serial.print(payload[i],HEX);  // hex เปรียบเทียบกับใน Server
+          Serial.print(" ");   
+        }
+        LoRaWAN.endPacket();
+        Serial.println("  END");
+        Serial.println("......................................................................");
+        
+        while (LoRaWAN.busy())
+        { }        
+    } // end if ส่งได้ ระบบไม่ยุ่ง      
+}  //end lora_send
+
+
+/* *****************************************************************************
+* For switch Data Rate (switch SF)
+* ******************************************************************************/
+void switch_DR()
+{ 
+   LoRaWAN.setDataRate(DR);     
+   if(DR>=5)
+       DR=0;
+   else
+       DR++;
+} // end switch_DR
