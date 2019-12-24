@@ -35,7 +35,10 @@
 const char *devEui = "XXXXXXXXXXXXXXXX"; 
 const char *appEui = "XXXXXXXXXXXXXXXX";
 const char *appKey = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-
+// Node 2
+//const char *devEui = "XXXXXXXXXXXXXXXX";
+//const char *appEui = "XXXXXXXXXXXXXXXX";
+//const char *appKey = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 unsigned int DR = 0;
 unsigned int TXPower = 14;
    
